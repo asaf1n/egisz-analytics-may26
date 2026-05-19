@@ -148,4 +148,52 @@ Contains SEMD document type reference data seeded directly in `db/dwh_init.sql`.
 - Metabase version: **v0.60.2.5**, deployed in Kubernetes (`k8s/metabase/`).
 - Dashboard JSON files are in `metabase_dashboards/` (6 dashboards: operational, service, documents, quality, executive, SEMD archive).
 - Dashboards are imported at container startup via `metabase/setup-dashboards.sh`.
-- Field filter defaults are in `metabase_dashboards/field_filter_defaults.yaml`; t
+- Field filter defaults are in `metabase_dashboards/field_filter_defaults.yaml`; they are applied by `scripts/apply_metabase_field_filters.py`.
+- Metabase uses its own PostgreSQL database (`metabase_app`). Do not mix it with `dwh_egisz` or `airflow_db`.
+- When altering the DWH schema, verify compatibility with:
+  1. Field filters in `scripts/apply_metabase_field_filters.py`
+  2. Dashboard JSON definitions in `metabase_dashboards/`
+
+---
+
+## 6. Kubernetes Deployment
+
+Both Airflow and Metabase run in Kubernetes (Docker Desktop by default).
+
+| Component | Manifests | Image |
+|---|---|---|
+| Airflow | `k8s/airflow/values.yaml` (Helm), `k8s/airflow/airflow-connections-secret.yaml` | `egisz-airflow-worker:latest` |
+| Metabase | `k8s/metabase/metabase.yaml`, `k8s/metabase/metabase-connections-secret.yaml` | `egisz-metabase:latest` |
+
+Deploy everything with:
+
+```powershell
+.\up.ps1               # build images, install/upgrade both components
+.\up.ps1 -Component Airflow   # Airflow only
+.\up.ps1 -Component Metabase  # Metabase only
+```
+
+- `k8s/metabase/metabase-connections-secret.yaml` is not committed; generate from the `.example.yaml` file.
+- Airflow internal metadata DB: `airflow_db` (separate from `dwh_egisz`).
+- Ports: Airflow → `localhost:8080`, Metabase → `localhost:3000`.
+
+---
+
+## 7. Code Style
+
+- Python ≥ 3.11; dependencies: `firebird-driver>=1.10.0,<2.0.0`, `psycopg2-binary>=2.9.9`.
+- Fully typed signatures (`from typing import Any`, etc.).
+- Comments only when the **why** is non-obvious (hidden constraint, workaround, subtle invariant). No task/ticket references in code.
+- No monolithic scripts — logic is decomposed into focused functions in `fb_client.py`, `pg_client.py`.
+
+---
+
+## 8. Anti-Patterns (What NOT to do)
+
+- Do NOT generate monolithic Python scripts for a single Airflow task.
+- Do NOT use `os.getenv('DB_PASSWORD')` or `.env` files inside DAGs or ELT modules.
+- Do NOT use the term `proxy_reports` in any identifier.
+- Do NOT write data to the `postgres` system database — all DWH writes target `dwh_egisz`.
+- Do NOT add Python-side row transformation logic; transformation belongs in the PostgreSQL function `egisz_transform_raw_to_facts`.
+- Do NOT use `LIMIT/OFFSET` for Firebird pagination — use `WHERE col > ? ROWS N` keyset pagination.
+- Do NOT use legacy Airflow operators (`PythonOperator`, `BashOperator`) for Python logic.

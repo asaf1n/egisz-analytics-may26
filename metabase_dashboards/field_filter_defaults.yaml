@@ -200,4 +200,13 @@ tags:
         display_name_not_contains: [Отправлено]
         table_ref: public.v_egisz_transactions_enriched_ui
         field_name: Обработано IPS
-      - query_contains: [v_rpt_documents_no_r
+      - query_contains: [v_rpt_documents_no_response_ui]
+        query_not_contains: [v_egisz_transactions_enriched_ui]
+        table_ref: public.v_rpt_documents_no_response_ui
+        field_name: Отправлено
+      - query_contains: [v_rpt_semd_archive_ui]
+        table_ref: public.v_rpt_semd_archive_ui
+        field_name: Дата обработки
+      - query_contains: [v_egisz_transactions_enriched_ui]
+        table_ref: public.v_egisz_transactions_enriched_ui
+        field_name: Обработано IPS

@@ -249,4 +249,57 @@ SELECT
     "Наименование клиники",
     NULL::text AS "OID организации",
     NULL::text AS "OID клиники",
-    COALESCE("localUid СЭМД", "MSGID обмена", "EGISZ_MESSAGES.EGMID (ключ записи, РЭМ
+    COALESCE("localUid СЭМД", "MSGID обмена", "EGISZ_MESSAGES.EGMID (ключ записи, РЭМД)") AS "Документ (ключ учёта)",
+    "localUid СЭМД",
+    "Связанное сообщение",
+    NULL::text AS "Рег. номер РЭМД",
+    'ожидание ответа' AS "Статус",
+    NULL::text AS "LOGID журнала EXCHANGELOG",
+    "EGISZ_MESSAGES.EGMID (ключ записи, РЭМД)",
+    "MSGID обмена",
+    NULL::timestamptz AS "Создание СЭМД",
+    NULL::text AS "Сводка ошибки"
+FROM public.v_rpt_documents_no_response_ui;
+
+CREATE OR REPLACE VIEW public.v_rpt_clinic_connectivity_daily_ui AS
+WITH success_by_day AS (
+    SELECT
+        "Обработано IPS"::date AS day,
+        NULLIF("JID клиники", '') AS jid,
+        MAX("Наименование клиники") AS clinic_name,
+        COUNT(DISTINCT "Документ (ключ учёта)") FILTER (WHERE "Статус" = 'success')::bigint AS ok_cnt,
+        COUNT(DISTINCT "Документ (ключ учёта)") FILTER (WHERE "Статус" = 'error')::bigint AS err_remd_cnt
+    FROM public.v_egisz_transactions_enriched_ui
+    GROUP BY 1, 2
+),
+network_by_day AS (
+    SELECT
+        "Дата создания документа"::date AS day,
+        NULLIF(COALESCE("JID клиники", "JID из журнала (gost, число)"), '') AS jid,
+        MAX("Клиника (транспорт)") AS clinic_name,
+        COUNT(DISTINCT "Ключ документа (группировка)")::bigint AS err_cnt
+    FROM public.v_rpt_network_errors_detail_ui
+    GROUP BY 1, 2
+)
+SELECT
+    COALESCE(s.day, n.day) AS "День",
+    COALESCE(s.jid, n.jid) AS "JID клиники (ключ)",
+    COALESCE(s.jid, n.jid) AS "JID клиники",
+    COALESCE(NULLIF(s.clinic_name, ''), NULLIF(n.clinic_name, ''), 'Клиника JID: ' || COALESCE(s.jid, n.jid)) AS "Наименование клиники",
+    COALESCE(s.ok_cnt, 0)::bigint AS "Успешные ответы РЭМД (документов)",
+    COALESCE(s.ok_cnt, 0)::bigint AS "Ответы РЭМД: успех (документов)",
+    COALESCE(s.err_remd_cnt, 0)::bigint AS "Ответы РЭМД: отказ (документов)",
+    COALESCE(n.err_cnt, 0)::bigint AS "Ошибки связи (документов)",
+    ROUND(100.0 * COALESCE(s.ok_cnt, 0) / NULLIF(COALESCE(s.ok_cnt, 0) + COALESCE(n.err_cnt, 0), 0), 2) AS "Доступность транспорта (прибл.), %"
+FROM success_by_day s
+FULL OUTER JOIN network_by_day n ON s.day = n.day AND s.jid = n.jid;
+
+CREATE OR REPLACE VIEW public.v_rpt_connectivity_global_daily_ui AS
+SELECT
+    "День",
+    SUM("Успешные ответы РЭМД (документов)")::bigint AS "Успешные ответы РЭМД (документов)",
+    SUM("Ошибки связи (документов)")::bigint AS "Ошибки связи (документов)",
+    ROUND(100.0 * SUM("Успешные ответы РЭМД (документов)") / NULLIF(SUM("Успешные ответы РЭМД (документов)") + SUM("Ошибки связи (документов)"), 0), 2) AS "Доступность транспорта (прибл.), %"
+FROM public.v_rpt_clinic_connectivity_daily_ui
+GROUP BY 1;
+

@@ -94,4 +94,33 @@ VALUES
     ('snils_invalid_text', 69, NULL, '(?is)(СНИЛС.*неверн|неверн.*СНИЛС|СНИЛС.*контрольн|контрольн.*СНИЛС)', 'Неверный формат или контрольная сумма СНИЛС', 'Данные пациента'),
     ('transport_network', 90, NULL, '(?is)(network|connection|transport|timeout|timed out|соединени|таймаут|сетевая ошибка)', 'Сетевая ошибка', 'Ошибки связи'),
     -- Additional canonical mappings to suppress raw-text leakage in error_type
-    ('cvc_datatype_extended', 24, NULL, '(?is)cvc-datatype-valid|cvc-pattern-valid|cvc-type|cvc-complex-type|cvc-attribute|cvc-elt|cvc-identity-constraint|cvc-particle|cvc-enumeration-valid', 'Ошибка XSD-валидации XML', 'Ошибки стр
+    ('cvc_datatype_extended', 24, NULL, '(?is)cvc-datatype-valid|cvc-pattern-valid|cvc-type|cvc-complex-type|cvc-attribute|cvc-elt|cvc-identity-constraint|cvc-particle|cvc-enumeration-valid', 'Ошибка XSD-валидации XML', 'Ошибки структуры и валидации'),
+    ('attribute_not_found_code', 50, 'ATTRIBUTE_NOT_FOUND', '(?is).*', 'Метаописание документа не соответствует зарегистрированному в РЭМД', 'Ошибки регистрации в РЭМД'),
+    ('role_occurrence_mismatch_code', 31, 'ROLE_OCCURRENCE_MISMATCH', '(?is).*', 'Подпись роли не соответствует требованиям РЭМД', 'Ошибки ЭП и сертификатов'),
+    ('object_not_found_text_extra', 76, NULL, '(?is)Подразделение.*(идентификатор|не найден)|подразделение.*не найден', 'Подразделение или запись справочника не найдены на дату документа', 'Ошибки регистрации в РЭМД'),
+    ('recipient_text_extra', 74, NULL, '(?is)RECIPIENT_INFO_MISMATCH|Получатель.*не найден', 'Получатель из запроса не найден в СЭМД', 'Данные пациента'),
+    ('dul_patient_text', 78, NULL, '(?is)ДУЛ[^А-Яа-я]|реквизит.*удостоверени', 'Документ, удостоверяющий личность пациента: некорректные реквизиты', 'Данные пациента'),
+    ('patient_birth_text', 15, NULL, '(?is)Дата рождения пациента|birthTime', 'Дата рождения пациента не заполнена или некорректна', 'Данные пациента'),
+    ('remd_runtime_internal', 80, NULL, '(?is)(INTERNAL_ERROR|RUNTIME_ERROR|внутренн.*ошиб|непредвиденн.*ошиб|невозможно обработать)', 'Техническая ошибка на стороне РЭМД', 'Технические ошибки РЭМД'),
+    -- Сертификат организации: специальный case для распознанного кода РЭМД
+    ('cert_org_validity_expired', 56, 'CANT_BUILD_CERT_CHAIN_TO_ACCREDITED_CA_CERT', '(?is).*', 'Срок действия сертификата организации истек', 'Ошибки ЭП и сертификатов'),
+    -- Несоответствие данных организации в ФРМО (ОГРН и подобные)
+    ('org_ogrn_frmo_mismatch', 11, NULL, '(?is)(ОГРН|ОКПО|КПП|ИНН).*(СЭМД|ФРМО).*(не совпада|не соответств)|ОГРН МО.*не совпада|ФРМО.*(не совпада|не соответств).*организац', 'Несоответствие данных организации в ФРМО', 'Ошибки организации / ИС'),
+    -- Generic fallback для прочих организационных ошибок
+    ('org_generic_fallback', 95, NULL, '(?is)(организаци|ОГРН|ФРМО|лицензи)', 'Ошибки организации', 'Ошибки организации / ИС')
+ON CONFLICT (rule_code) DO UPDATE SET
+    priority = EXCLUDED.priority,
+    match_code = EXCLUDED.match_code,
+    match_pattern = EXCLUDED.match_pattern,
+    interpretation = EXCLUDED.interpretation,
+    error_category = EXCLUDED.error_category,
+    is_active = true,
+    updated_at = now();
+
+-- Деактивируем generic-фолбэк, который раньше отдавал «Ошибка регистрации в РЭМД».
+-- При отсутствии конкретного типа теперь подставляется «Неизвестная ошибка»
+-- в egisz_error_classify (см. ниже).
+UPDATE egisz_error_interpretation_rules
+SET is_active = false, updated_at = now()
+WHERE rule_code = 'remd_async_response';
+

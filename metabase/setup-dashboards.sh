@@ -602,4 +602,17 @@ sync_metabase_schema
 ensure_collection
 maybe_skip_dashboard_import
 
-log_info "Importing dashboards to collection '${COLLE
+log_info "Importing dashboards to collection '${COLLECTION_NAME}' from ${DASHBOARDS_DIR}"
+archive_stale_collection_cards
+for file in "${DASHBOARDS_DIR}"/*.json; do
+  [ -f "${file}" ] || continue
+  dashboard_name=$(jq -r '.name' "${file}")
+  [ -n "${dashboard_name}" ] && [ "${dashboard_name}" != "null" ] || fail "dashboard file has no name: ${file}"
+  create_or_update_dashboard "${file}" >/dev/null
+  log_info "Imported ${dashboard_name}"
+done
+
+verify_collection_contents
+verify_dashboard_cards
+write_dashboard_manifest
+log_info "Setup complete: collection '${COLLECTION_NAME}' contains $(ls "${DASHBOARDS_DIR}"/*.json | wc -l | tr -d ' ') dashboard(s)."

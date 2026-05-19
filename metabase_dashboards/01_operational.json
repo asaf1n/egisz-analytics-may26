@@ -1392,4 +1392,92 @@
             "[\"name\",\"service_id\"]": {
               "display_as": null
             },
-            "[\"name\",\"transaction
+            "[\"name\",\"transaction_id\"]": {
+              "display_as": null
+            }
+          }
+        },
+        "column_settings": {
+          "[\"name\",\"% ошибок\"]": {
+            "column_title": "% ошибок",
+            "decimals": 2
+          },
+          "[\"name\",\"Всего\"]": {
+            "column_title": "Всего",
+            "decimals": 0,
+            "number_separators": "."
+          },
+          "[\"name\",\"Дата\"]": {
+            "column_title": "Дата"
+          },
+          "[\"name\",\"Ошибок\"]": {
+            "column_title": "Ошибок",
+            "decimals": 0,
+            "number_separators": "."
+          }
+        },
+        "graph.metrics": [
+          "% ошибок"
+        ]
+      },
+      "sizeX": 24,
+      "sizeY": 6,
+      "row": 40,
+      "col": 0,
+      "metabase-field-filters": {
+        "dwh_date": {
+          "table_ref": "public.v_egisz_transactions_enriched_ui",
+          "field_name": "День (тренд)"
+        }
+      }
+    },
+    {
+      "name": "01 · Объём по часам (72 ч от последнего наблюдения)",
+      "description": "Нагрузка по «Обработано IPS» (EGISZ_MESSAGES.CREATEDATE → EXCHANGELOG.CREATEDATE), последние 72 часа относительно MAX(\"Обработано IPS\") в данных; часовая детализация без общего фильтра дашборда.",
+      "dataset_query": {
+        "type": "native",
+        "native": {
+          "query": "WITH vit_ref AS ( SELECT COALESCE((SELECT MAX(\"Обработано IPS\") FROM public.v_egisz_transactions_enriched_ui), NOW()) AS ref_ts ) SELECT date_trunc('hour', \"Обработано IPS\") AS \"Час\", COUNT(DISTINCT \"Документ (ключ учёта)\")::bigint AS \"Документов\" FROM public.v_egisz_transactions_enriched_ui CROSS JOIN vit_ref WHERE \"Обработано IPS\" >= vit_ref.ref_ts - INTERVAL '72 hours' GROUP BY 1 ORDER BY 1 ASC",
+          "template-tags": {}
+        },
+        "database": 1
+      },
+      "display": "line",
+      "visualization_settings": {
+        "graph.dimensions": [
+          "Час"
+        ],
+        "table": {
+          "columns": {
+            "[\"name\",\"clinic_id\"]": {
+              "display_as": null
+            },
+            "[\"name\",\"service_id\"]": {
+              "display_as": null
+            },
+            "[\"name\",\"transaction_id\"]": {
+              "display_as": null
+            }
+          }
+        },
+        "column_settings": {
+          "[\"name\",\"Документов\"]": {
+            "column_title": "Документов",
+            "decimals": 0,
+            "number_separators": "."
+          },
+          "[\"name\",\"Час\"]": {
+            "column_title": "Час"
+          }
+        },
+        "graph.metrics": [
+          "Документов"
+        ]
+      },
+      "sizeX": 24,
+      "sizeY": 6,
+      "row": 46,
+      "col": 0
+    }
+  ]
+}

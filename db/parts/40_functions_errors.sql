@@ -349,4 +349,109 @@ AS $$
     WITH normalized AS (
         SELECT CASE jsonb_typeof(COALESCE(p_errors, '[]'::jsonb))
             WHEN 'array' THEN COALESCE(p_errors, '[]'::jsonb)
-            WHEN 'object' THEN jsonb_build
+            WHEN 'object' THEN jsonb_build_array(COALESCE(p_errors, '{}'::jsonb))
+            ELSE '[]'::jsonb
+        END AS payload
+    ),
+    items AS (
+        SELECT
+            o,
+            NULLIF(btrim(e->>'message'), '') AS t
+        FROM normalized n
+        CROSS JOIN LATERAL jsonb_array_elements(n.payload) WITH ORDINALITY AS x(e, o)
+    ),
+    first_pos AS (
+        SELECT t, MIN(o) AS first_o
+        FROM items
+        WHERE t IS NOT NULL
+        GROUP BY t
+    )
+    SELECT NULLIF(string_agg(t, ' · ' ORDER BY first_o), '')
+    FROM first_pos;
+$$;
+
+CREATE OR REPLACE FUNCTION public.egisz_xml_error_items(payload text)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    item_xml text;
+    item_code text;
+    item_message text;
+    result jsonb := '[]'::jsonb;
+BEGIN
+    IF payload IS NULL OR position('<' in payload) = 0 THEN
+        RETURN result;
+    END IF;
+
+    FOR item_xml IN
+        SELECT part
+        FROM regexp_split_to_table(payload, '<(?:[A-Za-z0-9_]+:)?item(?:\s[^>]*)?>', 'i') AS part
+    LOOP
+        item_code := public.egisz_xml_text(item_xml, 'code');
+        item_message := public.egisz_xml_text(item_xml, 'message');
+        IF NULLIF(btrim(COALESCE(item_code, '')), '') IS NOT NULL
+           OR NULLIF(btrim(COALESCE(item_message, '')), '') IS NOT NULL THEN
+            result := result || jsonb_build_array(jsonb_build_object('code', item_code, 'message', item_message));
+        END IF;
+    END LOOP;
+
+    RETURN result;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.egisz_build_errors_json(
+    p_status text,
+    p_error_code text,
+    p_error_message text,
+    p_msgtext text
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    WITH xml_items AS (
+        SELECT public.egisz_xml_error_items(p_msgtext) AS items
+    )
+    SELECT CASE
+        WHEN p_status <> 'error' THEN '[]'::jsonb
+        WHEN jsonb_array_length(items) > 0 THEN items
+        WHEN NULLIF(btrim(COALESCE(p_error_code, '')), '') IS NOT NULL
+          OR NULLIF(btrim(COALESCE(p_error_message, '')), '') IS NOT NULL
+          THEN jsonb_build_array(jsonb_build_object('code', p_error_code, 'message', p_error_message))
+        ELSE '[]'::jsonb
+    END
+    FROM xml_items;
+$$;
+
+CREATE OR REPLACE FUNCTION public.egisz_semd_type_report_label(semd_code text, semd_name text)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    WITH resolved AS (
+        SELECT
+            public.egisz_normalize_semd_code(semd_code) AS code,
+            COALESCE(
+                d.name,
+                CASE
+                    WHEN public.egisz_clean_text_value(semd_name) IS NOT NULL
+                     AND public.egisz_clean_text_value(semd_name) !~ '^\d+$'
+                     AND public.egisz_clean_text_value(semd_name) <> public.egisz_normalize_semd_code(semd_code)
+                    THEN public.egisz_clean_text_value(semd_name)
+                    ELSE NULL
+                END
+            ) AS display_name
+        FROM (SELECT public.egisz_normalize_semd_code(semd_code) AS code) n
+        LEFT JOIN public.dim_semd_types d ON d.code = n.code
+    )
+    SELECT CASE
+        WHEN code IS NULL AND display_name IS NULL THEN '(неизвестно)'
+        WHEN code IS NULL THEN display_name
+        WHEN display_name IS NULL THEN code || ' · Наименование СЭМД отсутствует в справочнике СЭМД'
+        ELSE code || ' · ' || display_name
+    END
+    FROM resolved;
+$$;
+

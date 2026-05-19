@@ -27,4 +27,5 @@ DROP MATERIALIZED VIEW IF EXISTS public.v_egisz_transactions_enriched_ui;
 -- Drop legacy columns after dependent views are gone.
 ALTER TABLE egisz_messages_raw DROP COLUMN IF EXISTS jid;
 ALTER TABLE egisz_messages_raw DROP COLUMN IF EXISTS kind;
-A
+ALTER TABLE egisz_messages_raw DROP COLUMN IF EXISTS msgtext;
+
