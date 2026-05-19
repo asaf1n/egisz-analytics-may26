@@ -1,0 +1,151 @@
+# AI Agent Instructions (AGENTS.md / .cursorrules)
+
+You are an expert Data Engineer and DevOps Architect. Whenever you generate, refactor, or review code in this repository, strictly adhere to the following architectural guidelines and naming conventions.
+
+---
+
+## 1. Domain-Driven Naming Conventions (STRICT)
+
+Do not invent names. Follow this exact taxonomy:
+
+| Concept | Name | Notes |
+|---|---|---|
+| Domain / Python package | `egisz` / `egisz_elt` | Package lives in `src/egisz_elt/` |
+| Main DAG file | `egisz_elt_dag.py` | In `airflow/dags/` |
+| Source database (Firebird 5) | `proxy_egisz` | Airflow conn ID: `proxy_egisz_fb` |
+| Target DWH (PostgreSQL) | `dwh_egisz` | Airflow conn ID: `dwh_egisz_pg` |
+| Raw EXCHANGELOG table | `exchangelog_raw` | PK: `logid bigint` |
+| Raw EGISZ_MESSAGES table | `egisz_messages_raw` | PK: `egmid bigint` |
+| Dimension: organizations | `dim_organizations` | Source: Firebird `JPERSONS` |
+| Dimension: licenses | `dim_licenses` | Source: Firebird `EGISZ_LICENSES` |
+| Dimension: SEMD types | `dim_semd_types` | Static reference table |
+| Fact table | `fact_egisz_transactions` | Populated by `egisz_transform_raw_to_facts()` |
+| Materialized views | `v_*` | Physical MV names in this repo include `v_egisz_transactions_enriched_ui` and `v_stg_channel_errors_by_document`; they are refreshed by a separate Airflow task |
+| Watermark table | `elt_state` | Tracks `last_log_id` and `last_egmid` per pipeline |
+
+**NEVER** use the legacy term `proxy_reports` in any variable, class, file, or SQL object name.
+
+---
+
+## 2. Airflow-Native Architecture (TaskFlow API)
+
+Airflow version: **2.11.2**. Use it as a first-class orchestrator, not a cron wrapper.
+
+### Decorators
+
+Always use `@dag` and `@task`. Never use legacy `PythonOperator`, `BashOperator`, or similar for Python logic.
+
+### Task pipeline (in order)
+
+```
+sync_dimensions >> extract_from_proxy >> load_to_dwh >> analyze_raw_tables >> transform_data >> refresh_materialized_views >> update_watermark
+```
+
+| Task | Responsibility |
+|---|---|
+| `sync_dimensions` | Full reload of `dim_organizations` (from `JPERSONS`) and `dim_licenses` (from `EGISZ_LICENSES`) via UPSERT |
+| `extract_from_proxy` | Read current watermarks from `elt_state`; fetch `EXCHANGELOG` by `LOGID` and `EGISZ_MESSAGES` by `EGMID`; resolve cross-referenced messages from XML payload; return XCom dict |
+| `load_to_dwh` | UPSERT fetched rows into `exchangelog_raw` and `egisz_messages_raw`; pass XCom dict downstream |
+| `analyze_raw_tables` | `ANALYZE public.exchangelog_raw` / `public.egisz_messages_raw` (only for tables that actually got rows in this batch). Runs in autocommit. Required: without it the planner uses stale `pg_class.reltuples=0` after the initial bulk COPY and picks seq-scan over `exchangelog_raw` (~1.2 GB) instead of the functional `msgid_norm` / `document_id_norm` indexes — Metabase queries then hang for 8–16 minutes. Autovacuum won't ANALYZE soon enough on a quiet pipeline. Cheap (~1s) per batch. |
+| `transform_data` | Call `public.egisz_transform_raw_to_facts(min_log_id, max_log_id, min_egmid, max_egmid)`. The function does not refresh materialized views; refresh is a separate task. |
+| `refresh_materialized_views` | `REFRESH MATERIALIZED VIEW CONCURRENTLY` for `v_egisz_transactions_enriched_ui` and `v_stg_channel_errors_by_document` |
+| `update_watermark` | UPSERT `elt_state` using `GREATEST(current, new)` for both `last_log_id` and `last_egmid` |
+
+### Batch size and schedule
+
+```python
+BATCH_SIZE = 5000   # rows per Firebird fetch
+schedule  = "*/5 * * * *"
+max_active_runs = 1
+```
+
+### XCom payload shape (between tasks)
+
+```python
+{
+    "count": int,           # EXCHANGELOG rows fetched
+    "message_count": int,   # EGISZ_MESSAGES rows fetched (including related)
+    "last_log_id": int,     # watermark before this run
+    "last_egmid": int,      # watermark before this run
+    "max_id": int,          # max LOGID in this batch
+    "max_egmid": int,       # max EGMID in this batch (cursor-based, not including related)
+    "rows": list[dict],     # serialized EXCHANGELOG rows
+    "message_rows": list[dict],  # serialized EGISZ_MESSAGES rows
+}
+```
+
+All tasks must be idempotent. PostgreSQL writes use `INSERT ... ON CONFLICT DO UPDATE`.
+
+---
+
+## 3. Secrets & Connections Management
+
+- **NEVER** read credentials from `.env` files or `os.getenv()` inside DAGs or ELT modules.
+- Always use Airflow connection management:
+  - Firebird source: `BaseHook.get_connection('proxy_egisz_fb')`
+  - PostgreSQL DWH: `BaseHook.get_connection('dwh_egisz_pg')`
+- Service accounts:
+  - `egisz` — DWH owner; used by Airflow ELT for writes and transforms
+  - `postgres` — read-only/BI access for Metabase
+
+---
+
+## 4. DWH Model and SQL
+
+### Schema initialization
+
+All DDL lives in **`db/dwh_init.sql`** (thin collector) plus ordered modules under **`db/parts/`**. Run as:
+
+```bash
+psql -U postgres -d dwh_egisz -v ON_ERROR_STOP=1 -f db/dwh_init.sql
+```
+
+Module order (matters — views depend on functions which depend on tables):
+
+```
+db/parts/00_bootstrap.sql                  — role + grants
+db/parts/10_tables.sql                     — tables, dim_semd_types seed, fact + indexes
+db/parts/20_functions_parsing.sql          — xml_text, normalize_message_id, clean_host, ...
+db/parts/30_error_rules.sql                — egisz_error_interpretation_rules table + seed
+db/parts/40_functions_errors.sql           — error classify / interpretation / build_errors_json / semd_type_report_label
+db/parts/50_transform.sql                  — egisz_transform_raw_to_facts
+db/parts/60_drop_dependents.sql            — DROP dependent views and legacy columns before re-creating views
+db/parts/70_views_core.sql                 — v_egisz_transactions_enriched_ui (MV) + v_rpt_error_interpretations_ui
+db/parts/75_views_stg.sql                  — v_stg_channel_errors_by_document (MV) + network alias
+db/parts/80_views_rpt.sql                  — v_rpt_* report views (network errors, no_response, semd_archive, connectivity)
+db/parts/90_views_health_and_finalize.sql  — v_health_* views + GRANT verification + REFRESH MVs
+```
+
+Every module is individually idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`, `ALTER TABLE ... IF EXISTS`, `INSERT ... ON CONFLICT`). When adding a new table, column, function, or view: edit the matching `db/parts/*.sql` module in the same idempotent style. **Do not create migration files** — there is no `migrations/` directory, and `db/dwh_init.sql` + `db/parts/` is the single source of truth for DWH schema. New dev DWHs are bootstrapped by a single `psql -f db/dwh_init.sql` run.
+
+### Transform function
+
+Data transformation happens **during DAG execution**, inside the `transform_data` Airflow task. The task calls a PostgreSQL stored function that does all the real work — parsing SOAP/XML payloads, enriching rows, and writing to `fact_egisz_transactions`:
+
+```sql
+SELECT public.egisz_transform_raw_to_facts(min_log_id, max_log_id, min_egmid, max_egmid)
+```
+
+The Python task only invokes this function; **all transformation logic lives in SQL, not Python**. Materialized view refresh stays in the separate `refresh_materialized_views` Airflow task and must not be duplicated inside `egisz_transform_raw_to_facts()`. Do not implement row-level transformation in Python (e.g., iterating rows and mutating them before writing). `normalize.py` is a compatibility stub — it contains no active logic.
+
+Transformation is **not** deferred to dashboard query time. By the time Metabase reads the data, `fact_egisz_transactions` and materialized views are already populated.
+
+### Firebird-specific serialization
+
+- BLOB/text columns are read via `_serialize_firebird_text()` in `fb_client.py` → returns `str | None`.
+- Date/datetime fields are converted with `.isoformat()` before XCom serialization.
+- EGISZ UUIDs may be wrapped as `<urn:uuid:...>` — normalize with `normalize_message_id()` in `pg_client.py`.
+- Keyset pagination on Firebird uses `WHERE col > ? ORDER BY col ROWS N` syntax (not `LIMIT/OFFSET`).
+
+### `dim_semd_types`
+
+Contains SEMD document type reference data seeded directly in `db/dwh_init.sql`. Do not move this data to a separate file or external source.
+
+---
+
+## 5. BI & Metabase Integration
+
+- Metabase version: **v0.60.2.5**, deployed in Kubernetes (`k8s/metabase/`).
+- Dashboard JSON files are in `metabase_dashboards/` (6 dashboards: operational, service, documents, quality, executive, SEMD archive).
+- Dashboards are imported at container startup via `metabase/setup-dashboards.sh`.
+- Field filter defaults are in `metabase_dashboards/field_filter_defaults.yaml`; t
