@@ -17,14 +17,17 @@
 ## Содержание
 
 - [Контекст](#context)
-- [Что делает сервис](#what-it-does)
+- [Описание прототипа сервиса](#service-overview)
 - [Архитектура и поток данных](#architecture)
 - [Источник: прокси-БД интегратора (Firebird proxy_egisz)](#source)
-- [ELT-конвейер Airflow](#elt-pipeline)
-- [Парсинг и нормализация payload](#parsing)
-- [Классификация ошибок](#error-classification)
-- [DWH-модель](#dwh-model)
-- [Аналитика и дашборды Metabase](#dashboards)
+- **Airflow**
+  - [ELT-конвейер Airflow](#elt-pipeline)
+- **DWH**
+  - [DWH-модель](#dwh-model)
+  - [Правила парсинга SOAP/XML](#parsing)
+  - [Классификация ошибок](#error-classification)
+- **Аналитика в Metabase**
+  - [Дашборды Metabase](#dashboards)
 - [Эксплуатация](#operations)
 - [Структура репозитория](#repository-structure)
 - [Глоссарий](#glossary)
@@ -43,7 +46,7 @@
 
 ---
 
-## Что делает сервис <a name="what-it-does"></a>
+## Описание прототипа сервиса <a name="service-overview"></a>
 
 Сервис закрывает пять эксплуатационных задач.
 
@@ -91,6 +94,8 @@ ELT-схема: Python в Airflow отвечает за извлечение и 
 
 ---
 
+# Airflow
+
 ## ELT-конвейер Airflow <a name="elt-pipeline"></a>
 
 DAG `egisz_elt_dag` собран на TaskFlow API, расписание `*/5 * * * *`, `max_active_runs=1`, размер батча `BATCH_SIZE = 5000`.
@@ -121,59 +126,7 @@ XCom-payload между тасками имеет фиксированную с�
 
 ---
 
-## Парсинг и нормализация payload <a name="parsing"></a>
-
-Работа с XML выполняется на стороне PostgreSQL — 6 утилитных функций в `db/parts/20_functions_parsing.sql`. Правила парсинга проверяются прямыми SELECT'ами в БД.
-
-| Функция | Роль |
-|---|---|
-| `egisz_xml_text` | Извлечение текста между тегами вида `<*:tag>...</*:tag>` агностично к префиксу неймспейса. Базовая функция для всех остальных. |
-| `egisz_normalize_message_id` | Приведение `<urn:uuid:...>`, `urn:uuid:...` и голого UUID к канонической форме. На нормализованное значение повешены функциональные индексы. |
-| `safe_cast_timestamptz` | Безопасный каст в `timestamptz` — возвращает `NULL` вместо исключения на нестандартных форматах дат в payload. |
-| `egisz_clean_host` | Нормализация хоста callback-URL для JOIN со справочником. |
-| `egisz_extract_jid_from_endpoint` | Извлечение `JID` организации из URL вида `gost-1234.infoclinica.lan`. |
-| `egisz_clean_text_value` | Нормализация текстовых полей: схлопывание пробелов, удаление BOM и неразрывных пробелов, обрезка. |
-| `egisz_normalize_semd_code` | Нормализация кода СЭМД (разные версии шаблонов используют разные префиксы и суффиксы). |
-
-Парсинг payload в `egisz_transform_raw_to_facts` идёт в три прохода: идентификаторы и статус → ошибки → JSON-payload ошибок для drill-down в Metabase.
-
-Сигнатуры функций — в комментариях к SQL-файлу.
-
----
-
-## Классификация ошибок <a name="error-classification"></a>
-
-РЭМД возвращает ошибки в нескольких формах: машиночитаемый код в SOAP-faultcode (`VALIDATION_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT` и др.), текст, отдельные `<item>` внутри ответного XML (до десятка в одном callback), Schematron-фрагменты в человеческом тексте. Сырые `error_message` дают несколько тысяч уникальных формулировок — для агрегации в дашборде они приводятся к **69 каноническим категориям** (плюс `Неизвестная ошибка`).
-
-Классификация декларативная: правила хранятся в таблице `egisz_error_interpretation_rules` (`db/parts/30_error_rules.sql`), применяет их функция `egisz_error_interpretation_type(error_code, error_message)` (`db/parts/40_functions_errors.sql`). Каждое правило — тройка `(match_code, match_pattern, interpretation)` с приоритетом.
-
-Несколько `<item>` разных типов в одном callback дедуплицируются и склеиваются через ` · `. Если ни одно правило не сработало — `error_type = 'Неизвестная ошибка'`.
-
-| Группа | Содержание |
-|---|---|
-| **Структурная валидация СЭМД** | Schematron, XSD, парсинг XML. |
-| **Справочники НСИ** | Устаревшая версия справочника, отсутствующий код, неверное наименование. |
-| **Регистры пациента и медработника** | ФРМР, ФРМО, ГИП: несовпадение СНИЛС, должности, отчества, подразделения. |
-| **Организация и лицензии** | ОГРН в СЭМД не совпадает с ФРМО, лицензия не найдена, организация не привязана к РМИС. |
-| **Регистрация ИС в РЭМД** | `ACCESS_DENIED`, `DISABLED_RMIS`, `NO_RMIS`. |
-| **Электронная подпись и сертификаты** | Сертификат истёк, отозван, недействителен на дату документа, недоступен CRL/OCSP. |
-| **Документооборот РЭМД** | Документ уже зарегистрирован, не найден, запрос дублируется или аннулирован. |
-| **Получение файла ЭМД из ИС** | `getDocumentFile` вернул ошибку, файл не передан, МИС недоступна (обратное направление: РЭМД запрашивает файл у МИС). |
-| **Технические ошибки РЭМД** | `INTERNAL_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT`, недоступность УЦ. |
-| **Сетевая ошибка** | Таймауты и обрывы между шлюзом и РЭМД. |
-| **Неизвестная ошибка** | Финальный fallback. |
-
-Полная таблица всех 69 правил — в [приложении](#appendix) и в `db/parts/30_error_rules.sql`.
-
-Результат классификации сохраняется в трёх полях фактовой таблицы:
-
-- `error_type` — канонический тип для группировки в дашбордах.
-- `error_summary` — краткая пользовательская интерпретация для карточек.
-- `error_json_text` — полный JSON всех `<item>` в структуре `{code, message, type}` для drill-down.
-
-View `v_rpt_error_interpretations_ui` раскрывает интерпретации построчно — для аудита правил.
-
----
+# DWH
 
 ## DWH-модель <a name="dwh-model"></a>
 
@@ -212,85 +165,106 @@ View `v_rpt_error_interpretations_ui` раскрывает интерпрета�
 
 ---
 
-## Аналитика и дашборды Metabase <a name="dashboards"></a>
+## Правила парсинга SOAP/XML <a name="parsing"></a>
 
-Шесть дашбордов, ~75 native-карточек. JSON-определения хранятся в `metabase_dashboards/`, импортируются скриптом `metabase/setup-dashboards.sh` при старте контейнера.
+Работа с XML выполняется на стороне PostgreSQL. Файл: `db/parts/20_functions_parsing.sql`.
 
-| Дашборд | Карточек | Назначение | Источники |
-|---|---|---|---|
-| **01 Оперативный мониторинг** `01_operational.json` | 12 | Контроль текущего потока отправки. Счётчики за час и день, динамика доли ошибок, топ типов ошибок за сутки. | `v_egisz_transactions_enriched_ui` |
-| **02 Сервис и healthcheck** `02_service.json` | 16 | Контроль ETL-контура и канала шлюза. Lag `update_watermark`, доля сбоев, объёмы по клиникам, heatmap клиника × день. | `v_health_*_ui`, `v_egisz_transactions_enriched_ui` |
-| **03 Документы без ответа** `03_documents_no_response.json` | 5 | Очередь эскалации. СЭМД без callback за настраиваемое окно (норматив >24 ч). | `v_rpt_documents_no_response_ui` |
-| **04 Ошибки и качество данных** `04_quality_and_errors.json` | 25 | Детальный анализ отказов: топ `error_type`, доля неклассифицированных ошибок, heatmap клиника × тип СЭМД. | `v_egisz_transactions_enriched_ui`, `v_stg_channel_errors_by_document`, `v_rpt_error_interpretations_ui` |
-| **05 Сводная статистика** `05_executive.json` | 15 | Управленческий срез. Общая доля успеха, топ причин отказов в процентах, динамика месяц к месяцу. | `v_egisz_transactions_enriched_ui`, `v_rpt_connectivity_global_daily_ui` |
-| **06 Архив СЭМД** `06_semd_archive.json` | 2 | Поиск документа по любому идентификатору. Полная цепочка: статус, ошибки, callback-URL, временны́е метки. | `v_rpt_semd_archive_ui` |
+### Архитектура парсинга
 
-Карточки работают поверх mat-view и `v_rpt_*_ui` — XML не парсится на стороне Metabase. Изменение логики парсинга или классификации требует только правки SQL-функции и `REFRESH MATERIALIZED VIEW`.
+Главная функция `egisz_transform_raw_to_facts` выполняет парсинг в три прохода:
 
-Field-фильтры (выпадающие списки реальных значений из БД) настраиваются скриптом `scripts/apply_metabase_field_filters.py` по правилам из `metabase_dashboards/field_filter_defaults.yaml`. Резолвер применяется при старте Metabase и при правке дашбордов; повторный прогон — no-op.
+| Проход | Что извлекается | Откуда |
+|---|---|---|
+| 1 — идентификаторы и статус | `messageId`, `relatesTo`, `localUid`, `emdrId`, `semd_code`, `semd_name`, `status`, callback-URL, временны́е метки | `EXCHANGELOG.MSGTEXT` |
+| 2 — ошибки | SOAP-faultcode, текст ошибки, список `<item>` | `EXCHANGELOG.MSGTEXT` (только для callback с ошибкой) |
+| 3 — JSON ошибок | Нормализованный JSON `{code, message, type}` по каждому `<item>` | результат прохода 2 |
 
----
+Правила парсинга проверяются прямыми SELECT'ами в БД без поднятия Airflow.
 
-## Эксплуатация <a name="operations"></a>
+### Утилитные функции
 
-**Локальный запуск.** `up.ps1` управляет Airflow и Metabase в Docker Desktop Kubernetes:
+| Функция | Назначение | Детали |
+|---|---|---|
+| `egisz_xml_text(payload, tag_name)` | Извлечение всех вхождений текста тега | Агностично к префиксу неймспейса; реализована через `regexp_matches`. Базовая функция для всех остальных. |
+| `egisz_normalize_message_id(value)` | Нормализация UUID-идентификаторов | Приводит `<urn:uuid:...>`, `urn:uuid:...` и голый UUID к единой форме. На нормализованное значение — функциональные индексы `idx_egisz_messages_msgid_norm`, `idx_fact_egisz_message_id_norm`, `idx_fact_egisz_relates_to_norm`. |
+| `safe_cast_timestamptz(p_text)` | Безопасный каст в `timestamptz` | Возвращает `NULL` вместо исключения. Используется потому что поля даты приходят в нескольких форматах (с/без таймзоны, ISO/локальный). |
+| `egisz_clean_host(p_text)` | Нормализация хоста callback-URL | Подготавливает хост для JOIN со справочником `dim_licenses`. |
+| `egisz_extract_jid_from_endpoint(p_text)` | Извлечение JID из URL | Из URL вида `gost-1234.infoclinica.lan` извлекает `1234` — внутренний ID организации. |
+| `egisz_clean_text_value(p_text)` | Нормализация текстовых полей | Схлопывание пробелов, удаление BOM и неразрывных пробелов, обрезка. |
+| `egisz_normalize_semd_code(p_text)` | Нормализация кода СЭМД | Разные версии шаблонов используют разные префиксы и суффиксы. |
 
-```powershell
-.\up.ps1                        # запуск/обновление Airflow + Metabase
-.\up.ps1 -Action Stop           # остановка без удаления PVC и данных Metabase
-.\up.ps1 -Action Airflow        # только Airflow
-.\up.ps1 -Action Metabase       # только Metabase
-.\up.ps1 -Action Stop-Airflow   # только остановка Airflow
-.\up.ps1 -Action Stop-Metabase  # только остановка Metabase
-```
+Полные сигнатуры — в комментариях к `db/parts/20_functions_parsing.sql`.
 
-**DWH.** Схема создаётся отдельно, разовой командой:
+### Нормализация идентификаторов
 
-```bash
-psql -U postgres -d dwh_egisz -v ON_ERROR_STOP=1 -f db/dwh_init.sql
-```
+Один и тот же идентификатор сообщения встречается в трёх формах:
 
-Этот же файл выполняется при обновлении модели — он идемпотентен. Перед первым прогоном нужны базовые объекты:
-
-```sql
-CREATE ROLE egisz LOGIN PASSWORD 'egisz';
-CREATE DATABASE dwh_egisz OWNER postgres;
-```
-
-**Connections.** В Airflow должны быть заведены два connection с фиксированными именами: `proxy_egisz_fb` (Firebird) и `dwh_egisz_pg` (PostgreSQL). Реквизиты хранятся в k8s-секретах: `k8s/airflow/airflow-connections-secret.yaml` и `k8s/metabase/metabase-connections-secret.yaml` (не коммитятся; в репозитории — примеры с суффиксом `.example.yaml`).
-
-**Мониторинг.** Дашборд `02_service.json`. Контрольные метрики: время последнего `update_watermark` (lag в норме — единицы минут), счётчик в `elt_state` (растёт), доля ошибочных DAG-runs в Airflow UI. При деградации — Airflow UI → упавший шаг.
-
-**Типовые сценарии:**
-
-| Ситуация | Куда смотреть |
+| Форма | Пример |
 |---|---|
-| Клиника не отправляет документы | `01_operational.json`, фильтр по клинике, динамика за неделю; при свежем провале — `02_service.json` |
-| Документ не дошёл до РЭМД | `06_semd_archive.json`, поиск по `localUid` или `messageId` |
-| Выросла доля отказов | `04_quality_and_errors.json`, топ `error_type` за период |
-| Еженедельная сводка для руководителя | `05_executive.json`, выгрузка PNG/CSV |
-| Растёт `Неизвестная ошибка` | `04_quality_and_errors.json`, фильтр `error_type = 'Неизвестная ошибка'` → добавить правило в `db/parts/30_error_rules.sql` → `psql -f db/dwh_init.sql` |
+| Голый UUID | `dd73fc79-e2e6-479c-a285-2a470fc4f04e` |
+| С префиксом | `urn:uuid:dd73fc79-e2e6-479c-a285-2a470fc4f04e` |
+| В угловых скобках | `<urn:uuid:dd73fc79-e2e6-479c-a285-2a470fc4f04e>` |
 
-**Troubleshooting производительности.** При деградации запросов из Metabase — проверить статистику планировщика для raw-таблиц; разовое лечение — `ANALYZE` под суперпользователем. Подробности — в комментариях к `analyze_raw_tables` в DAG.
-
-**CI.** В GitHub Actions (`.github/workflows/ci.yml`):
-
-- `pytest` на тестах из `tests/`;
-- прогон `db/dwh_init.sql` против чистой `postgres:16` с двойным запуском (проверка идемпотентности);
-- прогон `scripts/apply_metabase_field_filters.py` с проверкой no-op на втором запуске.
-
-Падение любой джобы блокирует мерж.
+Все три формы нормализуются к голому UUID. JOIN-ы между `exchangelog_raw`, `egisz_messages_raw` и `fact_egisz_transactions` работают по функциональным индексам на нормализованном значении.
 
 ---
 
-## Структура репозитория <a name="repository-structure"></a>
+## Классификация ошибок <a name="error-classification"></a>
 
-```
-airflow/dags/egisz_elt_dag.py     — DAG ELT-конвейера
-airflow/Dockerfile                 — образ Airflow-воркера
-src/egisz_elt/fb_client.py         — клиент Firebird
-src/egisz_elt/pg_client.py         — клиент PostgreSQL: raw-load, watermark, вызов transform
-db/dwh_init.sql                    — собиратель DWH через \i
-db/parts/                          — 11 модулей DWH (см. таблицу выше)
-metabase/                          — Dockerfile и provisioning Metabase
-metabase/setup-dashbo
+РЭМД возвращает ошибки в нескольких формах: машиночитаемый код в SOAP-faultcode (`VALIDATION_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT` и др.), текст, отдельные `<item>` внутри ответного XML (до десятка в одном callback), Schematron-фрагменты в человеческом тексте. Сырые `error_message` дают несколько тысяч уникальных формулировок — для агрегации в дашборде они приводятся к **69 каноническим категориям** (плюс `Неизвестная ошибка`).
+
+Классификация декларативная: правила хранятся в таблице `egisz_error_interpretation_rules` (`db/parts/30_error_rules.sql`), применяет их функция `egisz_error_interpretation_type(error_code, error_message)` (`db/parts/40_functions_errors.sql`). Каждое правило — тройка `(match_code, match_pattern, interpretation)` с приоритетом.
+
+Несколько `<item>` разных типов в одном callback дедуплицируются и склеиваются через ` · `. Если ни одно правило не сработало — `error_type = 'Неизвестная ошибка'`.
+
+Результат классификации сохраняется в трёх полях фактовой таблицы:
+
+- `error_type` — канонический тип для группировки в дашбордах.
+- `error_summary` — краткая пользовательская интерпретация для карточек.
+- `error_json_text` — полный JSON всех `<item>` в структуре `{code, message, type}` для drill-down.
+
+View `v_rpt_error_interpretations_ui` раскрывает интерпретации построчно — для аудита правил.
+
+### Группы ошибок
+
+| Группа | Правила | Содержание |
+|---|---|---|
+| **Структурная валидация СЭМД** | 1, 4, 8, 11–15 | Schematron, XSD, парсинг XML, обязательные поля CDA-документа. |
+| **Справочники НСИ** | 5, 13, 24–27 | Устаревшая версия справочника, отсутствующий код, неверное наименование. |
+| **Регистры пациента и медработника** | 6–10, 17–23, 56, 57, 59, 60 | ФРМР, ФРМО, ГИП: несовпадение СНИЛС, должности, отчества, подразделения. |
+| **Организация и лицензии** | 2, 3, 30, 37, 39, 65 | ОГРН в СЭМД не совпадает с ФРМО, лицензия не найдена, организация не привязана к РМИС. |
+| **Регистрация ИС в РЭМД** | 31–33 | `ACCESS_DENIED`, `DISABLED_RMIS`, `NO_RMIS`. |
+| **Электронная подпись и сертификаты** | 45–51 | Сертификат истёк, отозван, недействителен на дату документа, недоступен CRL/OCSP. |
+| **Документооборот РЭМД** | 16, 28, 29, 34–36, 38, 40, 54, 58 | Документ уже зарегистрирован, не найден, запрос дублируется или аннулирован. |
+| **Получение файла ЭМД из ИС** | 41–44 | `getDocumentFile` вернул ошибку, файл не передан, МИС недоступна. |
+| **Технические ошибки РЭМД** | 52, 53, 62, 63, 66–68 | `INTERNAL_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT`, недоступность УЦ. |
+| **Сетевая ошибка** | 64 | Таймауты и обрывы между шлюзом и РЭМД. |
+| **Неизвестная ошибка** | 69 | Финальный fallback. |
+
+### Полный список правил классификации
+
+Источник истины — `db/parts/30_error_rules.sql`. При добавлении нового правила seed расширяется через `INSERT ... ON CONFLICT (rule_code) DO UPDATE`.
+
+| № | Группа | Тип ошибки | SOAP-код | Паттерн текста | Пример сообщения |
+|---|---|---|---|---|---|
+| 1 | Структурная валидация | Не указан адрес пациента | `VALIDATION_ERROR` | `Schematron.*patientRole.*addr.*address:Type` | Элемент `patientRole/addr/address:Type` должен иметь не пустое значение |
+| 2 | Организация | Несоответствие данных организации в ФРМО | — | `(ОГРН|ОКПО|КПП|ИНН).*(СЭМД|ФРМО).*(не совпада|не соответств)` | ОГРН МО не совпадает с ОГРН в ФРМО |
+| 3 | Организация | Организация не привязана к РМИС | `VALIDATION_ERROR` | `не привязана к РМИС` | Организация не привязана к РМИС |
+| 4 | Структурная валидация | Некорректно заполнен телефон | `VALIDATION_ERROR` | `telecom.*(не пустым значением|@value)` | `telecom` должен соответствовать формату `tel:` |
+| 5 | Справочники НСИ | Специальность врача не соответствует справочнику НСИ | `VALIDATION_ERROR` | `assignedAuthor.*(code.*codeSystem|specialit)` | Специальность автора не соответствует НСИ |
+| 6 | Регистры | СНИЛС автора (врача) не заполнен или некорректен | `VALIDATION_ERROR` | `assignedAuthor.*(SNILS|СНИЛС)` | СНИЛС автора не указан |
+| 7 | Регистры | Дата рождения пациента не заполнена или некорректна | `VALIDATION_ERROR` | `patientRole.*birthTime` | Дата рождения пациента отличается от данных запроса |
+| 8 | Структурная валидация | ФИО пациента не заполнено или некорректно | `VALIDATION_ERROR` | `patientRole.*(name|given|family)` | `patientRole/name` пуст |
+| 9 | Регистры | СНИЛС пациента не заполнен или некорректен | `VALIDATION_ERROR` | `patientRole.*(SNILS|СНИЛС)` | СНИЛС пациента обязателен |
+| 10 | Регистры | Данные заверителя документа не заполнены или некорректны | `VALIDATION_ERROR` | `legalAuthenticator` | Блок `legalAuthenticator` не заполнен |
+| 11 | Структурная валидация | Дата/время создания документа не заполнены или некорректны | `VALIDATION_ERROR` | `creationTime.*(не заполнен|некорректн|не указан|обязател)` | Атрибут `creationTime` обязателен |
+| 12 | Структурная валидация | Ошибка XSD-валидации XML | — | `cvc-|XML_VALIDATION_ERROR|xsd|Invalid content was found` | `cvc-complex-type... Invalid content was found...` |
+| 13 | Справочники НСИ | Код типа документа не соответствует справочнику НСИ | `VALIDATION_ERROR` | `ClinicalDocument/code` | Код типа документа не из справочника |
+| 14 | Структурная валидация | Данные хранителя документа не заполнены | `VALIDATION_ERROR` | `custodian|representedCustodianOrganization` | `custodian` пуст |
+| 15 | Структурная валидация | Данные организации автора документа не заполнены | `VALIDATION_ERROR` | `assignedAuthor.*representedOrganization` | `representedOrganization` не заполнен |
+| 16 | Документооборот | Документ уже зарегистрирован в РЭМД | `NOT_UNIQUE_PROVIDED_ID` | — | Документ уже зарегистрирован в РЭМД |
+| 17 | Регистры | Данные пациента не соответствуют ГИП | `PATIENT_MPI_MISMATCH` | `(ГИП|GIP).*(пациент|patient)` | Пол пациента не соответствует данным ГИП |
+| 18 | Регистры | Должность врача не соответствует данным ФРМР | `PERSON_POST_IN_FRMR_MISMATCH` | `(ФРМР|FRMR).*(должност|specialit|специальност)` | Должность сотрудника не соответствует ФРМР |
+| 19 | Регистры | Медработник не найден в ФРМР | `PERSON_NOT_FOUND` | — | Медработник не найден в ФРМР |
+| 20 | Регистры | Данные медработника не соответствуют ФРМР | `VALUE_MISMATCH_METADATA_AND_FRMR` | `ФРМР|медработник|автор|author` | Дата рождения сотрудника не соответствует ФРМР |
+| 21 | Регистры | Подписант из сертификата не найден в ФРМР | `VALUE_MISMATCH_METADATA_AND_CERTIFICATE` | `не найдена актуальная.*карточка МР` | Актуальная карточка МР не найдена в Ф
