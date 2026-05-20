@@ -1,4 +1,4 @@
-# Cервис эксплуатационной аналитики интеграции с ЕГИСЗ
+# Cервис эксплуатационной аналитики обмена с ЕГИСЗ
 
 ---
 
@@ -267,12 +267,15 @@ Field-фильтры (`metabase-field-filters` в JSON-карточках) ва�
 
 ## Эксплуатация
 
-**Локальный запуск.** `up.ps1` поднимает оба компонента в Docker Desktop Kubernetes:
+**Локальный запуск и остановка.** `up.ps1` управляет Airflow и Metabase в Docker Desktop Kubernetes:
 
 ```powershell
-.\up.ps1                       # собрать оба образа, поставить/обновить Airflow + Metabase
-.\up.ps1 -Component Airflow    # только Airflow
-.\up.ps1 -Component Metabase   # только Metabase
+.\up.ps1                       # полный запуск/обновление Airflow + Metabase
+.\up.ps1 -Action Stop          # полная остановка без удаления PVC и настроек Metabase
+.\up.ps1 -Action Airflow       # только запуск/обновление Airflow
+.\up.ps1 -Action Metabase      # только запуск/обновление Metabase
+.\up.ps1 -Action Stop-Airflow  # только остановка Airflow
+.\up.ps1 -Action Stop-Metabase # только остановка Metabase
 ```
 
 DWH-схема создаётся отдельно, разовой командой против целевой БД:
