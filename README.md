@@ -17,18 +17,18 @@
 ## Содержание
 
 - [Контекст](#context)
-- [Описание прототипа сервиса](#service-overview)
+- [Обзор сервиса](#service-overview)
 - [Архитектура и поток данных](#architecture)
-- [Источник: прокси-БД интегратора (Firebird proxy_egisz)](#source)
+- [Extract: прокси-база сервиса интеграции](#extract)
 - **Airflow**
-  - [ELT-конвейер Airflow](#elt-pipeline)
+  - [ELT-Pipepine](#elt-pipeline)
 - **DWH**
   - [DWH-модель](#dwh-model)
   - [Правила парсинга SOAP/XML](#parsing)
   - [Классификация ошибок](#error-classification)
 - **Аналитика в Metabase**
   - [Дашборды Metabase](#dashboards)
-- [Эксплуатация](#operations)
+- [Эксплуатация и запуск прототипа](#operations)
 - [Структура репозитория](#repository-structure)
 - [Глоссарий](#glossary)
 
@@ -46,11 +46,11 @@
 
 ---
 
-## Описание прототипа сервиса <a name="service-overview"></a>
+## Обзор сервиса <a name="service-overview"></a>
 
 Сервис закрывает пять эксплуатационных задач.
 
-**Контроль отправки.** Число сообщений в час и в день, разрезы по клинике и типу документа, провалы и всплески. Прекращение отправки клиникой фиксируется по графикам.
+**Контроль отправки.** Число сообщений в час и в день, разрезы по клинике и типу документа, провалы и всплески. 
 
 **Контроль обратной связи.** На каждое исходящее СЭМД должен приходить callback от РЭМД, корректно склеенный с оригиналом по идентификаторам (`messageId`, `relatesTo`, `localUid`, `emdrId`). Документ без callback за окно >24 ч — кандидат на эскалацию.
 
@@ -80,7 +80,7 @@ ELT-схема: Python в Airflow отвечает за извлечение и 
 
 ---
 
-## Источник: прокси-БД интегратора (Firebird `proxy_egisz`) <a name="source"></a>
+## Extract: прокси-база сервиса интеграции <a name="extract"></a>
 
 Из таблиц шлюза читаются четыре. Выборка инкрементальная по монотонному ключу через keyset-пагинацию (`WHERE col > :last_seen ORDER BY col ROWS :limit`).
 
@@ -96,14 +96,14 @@ ELT-схема: Python в Airflow отвечает за извлечение и 
 
 # Airflow
 
-## ELT-конвейер Airflow <a name="elt-pipeline"></a>
+## ELT-Pipeline <a name="elt-pipeline"></a>
 
 DAG `egisz_elt_dag` собран на TaskFlow API, расписание `*/5 * * * *`, `max_active_runs=1`, размер батча `BATCH_SIZE = 5000`.
 
 Последовательность задач:
 
 ```
-sync_dimensions
+▸ sync_dimensions
   ▸ extract_from_proxy
     ▸ load_to_dwh
       ▸ analyze_raw_tables
@@ -211,9 +211,9 @@ XCom-payload между тасками имеет фиксированную с�
 
 ## Классификация ошибок <a name="error-classification"></a>
 
-РЭМД возвращает ошибки в нескольких формах: машиночитаемый код в SOAP-faultcode (`VALIDATION_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT` и др.), текст, отдельные `<item>` внутри ответного XML (до десятка в одном callback), Schematron-фрагменты в человеческом тексте. Сырые `error_message` дают несколько тысяч уникальных формулировок — для агрегации в дашборде они приводятся к **69 каноническим категориям** (плюс `Неизвестная ошибка`).
+РЭМД возвращает ошибки в нескольких формах: машиночитаемый код в SOAP-faultcode (`VALIDATION_ERROR`, `RUNTIME_ERROR`, `ASYNC_RESPONSE_TIMEOUT` и др.), текст, отдельные `<item>` внутри ответного XML (до десятка в одном callback), Schematron-фрагменты в человеческом тексте — для агрегации в дашборде они приводятся к **69 видам ошибок** (плюс `Неизвестная ошибка`).
 
-Классификация декларативная: правила хранятся в таблице `egisz_error_interpretation_rules` (`db/parts/30_error_rules.sql`), применяет их функция `egisz_error_interpretation_type(error_code, error_message)` (`db/parts/40_functions_errors.sql`). Каждое правило — тройка `(match_code, match_pattern, interpretation)` с приоритетом.
+Правила хранятся в таблице `egisz_error_interpretation_rules` (`db/parts/30_error_rules.sql`), применяет их функция `egisz_error_interpretation_type(error_code, error_message)` (`db/parts/40_functions_errors.sql`). Каждое правило — тройка `(match_code, match_pattern, interpretation)` с приоритетом.
 
 Несколько `<item>` разных типов в одном callback дедуплицируются и склеиваются через ` · `. Если ни одно правило не сработало — `error_type = 'Неизвестная ошибка'`.
 
@@ -241,7 +241,7 @@ View `v_rpt_error_interpretations_ui` раскрывает интерпрета�
 | **Сетевая ошибка** | 64 | Ошибки связи между шлюзом и клиниками. |
 | **Неизвестная ошибка** | 69 | - |
 
-### Полный список правил классификации
+### Полный список видов ошибок
 
 Источник истины — `db/parts/30_error_rules.sql`. При добавлении нового правила seed расширяется через `INSERT ... ON CONFLICT (rule_code) DO UPDATE`.
 
@@ -340,7 +340,7 @@ Field-фильтры (выпадающие списки реальных зна�
 
 ---
 
-## Эксплуатация <a name="operations"></a>
+## Эксплуатация и запуск прототипа <a name="operations"></a>
 
 **Локальный запуск.** `up.ps1` управляет Airflow и Metabase в Docker Desktop Kubernetes:
 
@@ -368,7 +368,7 @@ CREATE DATABASE dwh_egisz OWNER postgres;
 
 **Connections.** В Airflow должны быть заведены два connection с фиксированными именами: `proxy_egisz_fb` (Firebird) и `dwh_egisz_pg` (PostgreSQL). Реквизиты хранятся в k8s-секретах: `k8s/airflow/airflow-connections-secret.yaml` и `k8s/metabase/metabase-connections-secret.yaml` (не коммитятся; в репозитории — примеры с суффиксом `.example.yaml`).
 
-**Мониторинг.** Дашборд `02_service.json`. Контрольные метрики: время последнего `update_watermark` (lag в норме — единицы минут), счётчик в `elt_state` (растёт), доля ошибочных DAG-runs в Airflow UI. При деградации — Airflow UI → упавший шаг.
+**Мониторинг.** Дашборд `02_service.json`. Контрольные метрики: время последнего `update_watermark` (lag в норме — единицы минут), счётчик в `elt_state` (растёт), доля ошибочных DAG-runs в Airflow UI. 
 
 **Типовые сценарии:**
 
@@ -377,7 +377,7 @@ CREATE DATABASE dwh_egisz OWNER postgres;
 | Клиника не отправляет документы | `01_operational.json`, фильтр по клинике, динамика за неделю; при свежем провале — `02_service.json` |
 | Документ не дошёл до РЭМД | `06_semd_archive.json`, поиск по `localUid` или `messageId` |
 | Выросла доля отказов | `04_quality_and_errors.json`, топ `error_type` за период |
-| Еженедельная сводка для руководителя | `05_executive.json`, выгрузка PNG/CSV |
+| Еженедельная сводка | `05_executive.json`, выгрузка PNG/CSV |
 | Растёт `Неизвестная ошибка` | `04_quality_and_errors.json`, фильтр `error_type = 'Неизвестная ошибка'` → добавить правило в `db/parts/30_error_rules.sql` → `psql -f db/dwh_init.sql` |
 
 **Troubleshooting производительности.** При деградации запросов из Metabase — проверить статистику планировщика для raw-таблиц; разовое лечение — `ANALYZE` под суперпользователем. Подробности — в комментариях к `analyze_raw_tables` в DAG.
